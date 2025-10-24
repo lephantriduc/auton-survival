@@ -353,7 +353,7 @@ def predict_survival(model, x, a, t):
 def predict_latent_z(model, x):
 
   model, _ = model
-  gates = model.model.embedding(x)
+  gates = model.embedding(x)
 
   z_gate_probs = torch.exp(gates).sum(axis=2).detach().numpy()
 
