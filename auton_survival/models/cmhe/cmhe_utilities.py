@@ -364,6 +364,7 @@ def predict_latent_phi(model, x):
   model, _ = model
   x = model.embedding(x)
 
-  p_phi_gate = torch.nn.Softmax(dim=1)(model.phi_gate(x)).detach().numpy()
+  # p_phi_gate = torch.nn.Softmax(dim=1)(model.phi_gate(x)).detach().numpy()
+  p_phi_gate = model.phi_gate(x).detach().numpy()
 
   return p_phi_gate
