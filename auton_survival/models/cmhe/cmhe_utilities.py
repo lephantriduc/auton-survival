@@ -355,7 +355,7 @@ def predict_latent_z(model, x):
   model, _ = model
   gates = model.embedding(x)
 
-  z_gate_probs = torch.exp(gates).sum(axis=2).detach().numpy()
+  z_gate_probs = torch.exp(gates).detach().numpy()
 
   return z_gate_probs
 
