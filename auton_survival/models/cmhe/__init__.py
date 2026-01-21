@@ -75,15 +75,23 @@ Example Usage
 
 """
 
+
 import numpy as np
 import torch
+
+from tqdm import tqdm
 
 from .cmhe_torch import DeepCMHETorch
 from .cmhe_utilities import train_cmhe, predict_survival
 from .cmhe_utilities import predict_latent_phi, predict_latent_z
+from .cmhe_utilities import e_step, q_function, fit_breslow
 
 from auton_survival.utils import _dataframe_to_array
 
+try:
+    from sksurv.metrics import concordance_index_ipcw
+except ImportError:
+    print("Warning: sksurv not found. C-index logging will fail.")
 
 class DeepCoxMixturesHeterogenousEffects:
   """A Deep Cox Mixtures with Heterogenous Effects model.
@@ -213,38 +221,75 @@ class DeepCoxMixturesHeterogenousEffects:
                          gate_l2_penalty=self.gate_l2_penalty,
                          optimizer=optimizer)
 
+  # def fit(self, x, t, e, a, vsize=0.15, val_data=None,
+  #         iters=1, learning_rate=1e-3, batch_size=100,
+  #         patience=2, optimizer="Adam"):
+
+  #   r"""This method is used to train an instance of the DSM model.
+
+  #   Parameters
+  #   ----------
+  #   x: np.ndarray
+  #       A numpy array of the input features, \( x \).
+  #   t: np.ndarray
+  #       A numpy array of the event/censoring times, \( t \).
+  #   e: np.ndarray
+  #       A numpy array of the event/censoring indicators, \( \delta \).
+  #       \( \delta = 1 \) means the event took place.
+  #   a: np.ndarray
+  #       A numpy array of the treatment assignment indicators, \( a \).
+  #       \( a = 1 \) means the individual was treated.
+  #   vsize: float
+  #       Amount of data to set aside as the validation set.
+  #   val_data: tuple
+  #       A tuple of the validation dataset. If passed vsize is ignored.
+  #   iters: int
+  #       The maximum number of training iterations on the training dataset.
+  #   learning_rate: float
+  #       The learning rate for the `Adam` optimizer.
+  #   batch_size: int
+  #       learning is performed on mini-batches of input data. this parameter
+  #       specifies the size of each mini-batch.
+  #   optimizer: str
+  #       The choice of the gradient based optimization method. One of
+  #       'Adam', 'RMSProp' or 'SGD'.
+  #   """
+
+  #   processed_data = self._preprocess_training_data(x, t, e, a,
+  #                                                   vsize, val_data,
+  #                                                   self.random_seed)
+
+  #   x_tr, t_tr, e_tr, a_tr, x_vl, t_vl, e_vl, a_vl = processed_data
+
+  #   #Todo: Change this somehow. The base design shouldn't depend on child
+
+  #   inputdim = x_tr.shape[-1]
+
+  #   model = self._gen_torch_model(inputdim, optimizer)
+
+  #   model, _ = train_cmhe(model,
+  #                         (x_tr, t_tr, e_tr, a_tr),
+  #                         (x_vl, t_vl, e_vl, a_vl),
+  #                         epochs=iters,
+  #                         lr=learning_rate,
+  #                         bs=batch_size,
+  #                         patience=patience,
+  #                         return_losses=True,
+  #                         use_posteriors=True,
+  #                         random_seed=self.random_seed)
+
+  #   self.torch_model = (model[0].eval(), model[1])
+  #   self.fitted = True
+
+  #   return self
+
   def fit(self, x, t, e, a, vsize=0.15, val_data=None,
           iters=1, learning_rate=1e-3, batch_size=100,
-          patience=2, optimizer="Adam"):
+          patience=2, optimizer="Adam", 
+          modality_slices=None):
 
-    r"""This method is used to train an instance of the DSM model.
-
-    Parameters
-    ----------
-    x: np.ndarray
-        A numpy array of the input features, \( x \).
-    t: np.ndarray
-        A numpy array of the event/censoring times, \( t \).
-    e: np.ndarray
-        A numpy array of the event/censoring indicators, \( \delta \).
-        \( \delta = 1 \) means the event took place.
-    a: np.ndarray
-        A numpy array of the treatment assignment indicators, \( a \).
-        \( a = 1 \) means the individual was treated.
-    vsize: float
-        Amount of data to set aside as the validation set.
-    val_data: tuple
-        A tuple of the validation dataset. If passed vsize is ignored.
-    iters: int
-        The maximum number of training iterations on the training dataset.
-    learning_rate: float
-        The learning rate for the `Adam` optimizer.
-    batch_size: int
-        learning is performed on mini-batches of input data. this parameter
-        specifies the size of each mini-batch.
-    optimizer: str
-        The choice of the gradient based optimization method. One of
-        'Adam', 'RMSProp' or 'SGD'.
+    r"""
+    Fit method with Modality Imbalance Tracking using C-Index.
     """
 
     processed_data = self._preprocess_training_data(x, t, e, a,
@@ -253,24 +298,127 @@ class DeepCoxMixturesHeterogenousEffects:
 
     x_tr, t_tr, e_tr, a_tr, x_vl, t_vl, e_vl, a_vl = processed_data
 
-    #Todo: Change this somehow. The base design shouldn't depend on child
+    # --- SETUP C-INDEX EVALUATION ---
+    # 1. Create structured arrays for sksurv (required for IPW C-index)
+    # dtype must be [('event', bool), ('time', float)]
+    y_train_struc = np.array(
+        [(bool(e_val), t_val) for e_val, t_val in zip(e_tr.cpu().numpy(), t_tr.cpu().numpy())],
+        dtype=[('e', bool), ('t', float)]
+    )
+    y_val_struc = np.array(
+        [(bool(e_val), t_val) for e_val, t_val in zip(e_vl.cpu().numpy(), t_vl.cpu().numpy())],
+        dtype=[('e', bool), ('t', float)]
+    )
+
+    # 2. Pick an evaluation time horizon (e.g., median follow-up time)
+    # You can also pass this as an argument if you prefer specific times
+    eval_times = [np.median(t_tr.cpu().numpy())]
+    # -------------------------------
 
     inputdim = x_tr.shape[-1]
+    self.torch_model = self._gen_torch_model(inputdim, optimizer) #
 
-    model = self._gen_torch_model(inputdim, optimizer)
+    # Initialize History
+    self.history = {'epoch': [], 'joint': []}
+    if modality_slices:
+        for mod_name in modality_slices:
+            self.history[f'{mod_name}_only'] = []
 
-    model, _ = train_cmhe(model,
-                          (x_tr, t_tr, e_tr, a_tr),
-                          (x_vl, t_vl, e_vl, a_vl),
-                          epochs=iters,
-                          lr=learning_rate,
-                          bs=batch_size,
-                          patience=patience,
-                          return_losses=True,
-                          use_posteriors=True,
-                          random_seed=self.random_seed)
+    # Move to device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.torch_model.to(device)
+    
+    # Validation Tensors
+    x_vl_t = x_vl.to(device)
+    a_vl_t = a_vl.to(device) # We need treatment 'a' for prediction
+    
+    # Optimizer
+    optim = torch.optim.Adam(self.torch_model.parameters(), lr=learning_rate)
+    
+    breslow_splines = None
+    
+    print(f"Starting Training (Eval Time: {eval_times[0]:.1f})...")
+    
+    for epoch in tqdm(range(iters)):
+        self.torch_model.train()
+        
+        # Batching Setup
+        idx = torch.randperm(len(x_tr))
+        
+        # Mini-batch loop
+        for i in range(0, len(x_tr), batch_size):
+            batch_idx = idx[i:i+batch_size]
+            
+            xb = x_tr[batch_idx].to(device)
+            tb = t_tr[batch_idx].to(device)
+            eb = e_tr[batch_idx].to(device)
+            ab = a_tr[batch_idx].to(device)
+            
+            # Forward & Loss
+            gates, lrisks = self.torch_model(xb, ab)
+            
+            with torch.no_grad():
+                log_lik = e_step(self.torch_model, breslow_splines, xb, tb, eb, ab)
+            
+            loss = q_function(self.torch_model, xb, tb, eb, ab, log_lik, typ='soft')
+            
+            reg = (self.torch_model.phi_gate.weight**2).sum() + (self.torch_model.z_gate.weight**2).sum()
+            loss = loss + self.gate_l2_penalty * reg
+            
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
 
-    self.torch_model = (model[0].eval(), model[1])
+        # --- UPDATE BRESLOW (Every 10 epochs) ---
+        if epoch % 10 == 0:
+            with torch.no_grad():
+                x_tr_d = x_tr.to(device)
+                t_tr_d = t_tr.to(device)
+                e_tr_d = e_tr.to(device)
+                a_tr_d = a_tr.to(device)
+                
+                full_lik = e_step(self.torch_model, breslow_splines, x_tr_d, t_tr_d, e_tr_d, a_tr_d)
+                breslow_splines = fit_breslow(self.torch_model, x_tr_d, t_tr_d, e_tr_d, a_tr_d, 
+                                              log_likelihoods=full_lik, typ='soft', smoothing_factor=self.smoothing_factor)
+
+        # --- MODALITY CHECK (Every 10 epochs) ---
+        if epoch % 10 == 0 and breslow_splines is not None and modality_slices:
+            self.torch_model.eval()
+            
+            # Helper to calculate C-index
+            def get_cindex(input_tensor):
+                with torch.no_grad():
+                    # predict_survival returns survival prob S(t)
+                    surv_prob = predict_survival((self.torch_model, breslow_splines), input_tensor, a_vl_t, t=eval_times)
+                    # We use the first time point. Risk = 1 - Survival
+                    risk_scores = 1 - surv_prob[:, 0].cpu().numpy()
+                
+                try:
+                    c_idx = concordance_index_ipcw(y_train_struc, y_val_struc, risk_scores)[0]
+                    return c_idx
+                except Exception as e:
+                    return 0.5
+
+            # 1. Joint Performance
+            joint_c = get_cindex(x_vl_t)
+            self.history['joint'].append(joint_c)
+            self.history['epoch'].append(epoch)
+            
+            log_msg = f"Ep {epoch} | Joint C-idx: {joint_c:.3f}"
+
+            # 2. Individual Modalities
+            for mod_name, mod_slice in modality_slices.items():
+                # Zero out everything except the target modality
+                masked_x = torch.zeros_like(x_vl_t)
+                masked_x[:, mod_slice] = x_vl_t[:, mod_slice]
+                
+                mod_c = get_cindex(masked_x)
+                self.history[f'{mod_name}_only'].append(mod_c)
+                log_msg += f" | {mod_name}: {mod_c:.3f}"
+            
+            print(log_msg)
+
+    self.torch_model = (self.torch_model.eval(), breslow_splines)
     self.fitted = True
 
     return self
